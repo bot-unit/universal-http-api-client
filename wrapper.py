@@ -5,12 +5,18 @@
 from typing import Optional, Dict, Any, Type, TypeVar, List as ListType
 from pydantic import BaseModel
 
-from src.client.adapters import (
-    SyncHttpClient,
-    HttpxSyncAdapter,
-    HttpResponse,
-    HttpError,
-)
+try:
+    from .adapters import (
+        SyncHttpClient,
+        HttpxSyncAdapter,
+    )
+    from .response_utils import parse_response_model, ParsedResponse
+except ImportError:
+    from adapters import (  # type: ignore
+        SyncHttpClient,
+        HttpxSyncAdapter,
+    )
+    from response_utils import parse_response_model, ParsedResponse  # type: ignore
 
 T = TypeVar('T', bound=BaseModel)
 
@@ -42,6 +48,8 @@ class SyncClientWrapper:
             self.http_client = HttpxSyncAdapter(**adapter_config)
             self._owns_client = True
         else:
+            if getattr(http_client, "is_async", False):
+                raise TypeError("SyncClientWrapper requires a synchronous http_client.")
             self.http_client = http_client
             self._owns_client = False
 
@@ -64,7 +72,7 @@ class SyncClientWrapper:
         path: str,
         response_model: Optional[Type[T] | Type[ListType[T]]] = None,
         **kwargs: Any
-    ) -> T:
+    ) -> ParsedResponse:
         """
         Internal helper to make sync HTTP requests and parse responses.
 
@@ -75,56 +83,12 @@ class SyncClientWrapper:
             **kwargs: Additional request parameters (params, json, headers, etc.)
 
         Returns:
-            Parsed Pydantic model instance if response_model provided, else raw response
+            Parsed Pydantic model, list of models, or raw HttpResponse
 
         Raises:
             HttpError: For HTTP errors (4xx, 5xx)
             NetworkError: For connection errors
             TimeoutError: For request timeouts
         """
-        response: HttpResponse = self.http_client.request(method, path, **kwargs)
-
-        if response_model is None:
-            return response  # type: ignore
-
-        # Parse JSON response into Pydantic model
-        try:
-            data = response.json()
-        except ValueError as e:
-            status = response.status_code
-            if status == 404:
-                raise HttpError(status, f"Endpoint not found (404): {path}") from e
-            elif status == 401 or status == 403:
-                raise HttpError(status, f"Unauthorized ({status}): {path}") from e
-            elif status >= 500:
-                raise HttpError(status, f"Server error ({status}): {path}") from e
-            else:
-                raise HttpError(
-                    status,
-                    f"Failed to parse JSON response from {path}: {e}\\n"
-                    f"Response status: {status}\\n"
-                    f"Response body: {response.content}"
-                ) from e
-
-        try:
-            # Check if response_model is a list type (e.g., List[SomeModel])
-            import typing
-            origin = typing.get_origin(response_model)
-
-            if origin is list:
-                args = typing.get_args(response_model)
-                if args and isinstance(data, list):
-                    item_model = args[0]
-                    if not hasattr(item_model, 'model_validate'):
-                        return data  # type: ignore
-                    return [item_model.model_validate(item) for item in data]  # type: ignore
-
-            # Regular Pydantic model
-            return response_model.model_validate(data)
-        except Exception as e:
-            raise HttpError(
-                response.status_code,
-                f"Failed to validate response model for {path}: {e}\\n"
-                f"Expected model: {response_model.__name__ if hasattr(response_model, '__name__') else response_model}\\n"
-                f"Got data: {data}"
-            ) from e
+        response = self.http_client.request(method, path, **kwargs)
+        return parse_response_model(response, path, response_model)

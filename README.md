@@ -1,192 +1,192 @@
 # universal-http-api-client
 
-Python classes for building API clients with support for both synchronous and asynchronous HTTP operations.
+Lightweight wrappers and adapters for building HTTP API clients in Python, optimized for internal services that use `httpx` and `pydantic`.
 
-## Overview
+## Current State
 
-This library provides base wrapper classes for building HTTP API clients in Python. It abstracts HTTP client implementation details, provides automatic response parsing with Pydantic models, and offers a consistent API for making requests.
+This repository is intended to be copied into internal projects as source files.
 
-## Features
+Current file set:
 
-- **Base Wrapper Classes**: Ready-to-use `AsyncWrapper` and `SyncClientWrapper` for building API clients
-- **Pydantic Integration**:  Automatic response parsing into Pydantic models
-- **Protocol-based Adapters**: Uses Python's Protocol for structural typing, supporting both sync and async clients
-- **Error Handling**: Built-in exception classes for HTTP errors, network errors, and timeouts
-- **Context Manager Support**: Both sync and async context managers for automatic resource cleanup
-- **Flexible Configuration**: Support for custom timeouts, retries, headers, and SSL verification
-- **URL Management**:  Automatic base URL joining with endpoint paths
+- `__init__.py`
+- `adapters.py`
+- `wrapper.py`
+- `async_wrapper.py`
+- `response_utils.py`
 
-## Core Components
+There is no packaging metadata on purpose. The expected usage model is:
 
-### Wrapper Classes
+1. Copy the folder into your service codebase.
+2. Import the wrappers/adapters locally.
+3. Build a project-specific API client on top.
 
-**`AsyncWrapper`** - Base class for asynchronous API clients:
-- Automatic HTTP client initialization with `HttpxAsyncAdapter`
-- Pydantic model response parsing
-- Async context manager support
-- Built-in error handling
+## What It Provides
 
-**`SyncClientWrapper`** - Base class for synchronous API clients:
-- Automatic HTTP client initialization with `HttpxSyncAdapter`
-- Pydantic model response parsing
-- Context manager support
-- Built-in error handling
+- `SyncClientWrapper` for synchronous API clients
+- `AsyncWrapper` for asynchronous API clients
+- first-class support for `httpx`
+- optional fallback adapters for `requests`, `aiohttp`, and `urllib3`
+- unified `HttpResponse`, `HttpError`, `NetworkError`, and `TimeoutError`
+- optional retries, default headers, base URL handling, and context-manager support
+- response parsing through Pydantic models
 
-### Response & Error Handling
+## How To Embed
 
-**`HttpResponse`** - Unified response object:
-- `status_code`: HTTP status code
-- `headers`: Response headers dictionary
-- `content`: Raw bytes content
-- `json()`: Parse response as JSON
-- `text(encoding=None)`: Get response as text
+Recommended structure inside a service:
 
-**Exception Classes**:
-- **`HttpError`**: HTTP-level errors (4xx, 5xx) with status code and response body
-- **`NetworkError`**: Network-related issues
-- **`TimeoutError`**: Request timeouts
+```text
+your_service/
+  clients/
+    universal_http/
+      adapters.py
+      wrapper.py
+      async_wrapper.py
+      response_utils.py
+      __init__.py
+    billing_api.py
+```
 
-### Adapters (Internal)
+Then build your domain client on top of these files instead of importing the wrappers directly across the whole codebase.
 
-- **`HttpxAsyncAdapter`**: Async HTTP client adapter (httpx-based)
-- **`HttpxSyncAdapter`**: Sync HTTP client adapter (httpx-based)
-- Protocol interfaces:  `AsyncHttpClient`, `SyncHttpClient`
+## Preferred Path
 
-## Usage
+If your service uses `httpx` and `pydantic`, the intended default path is:
 
-### Creating Your API Client
+- subclass `SyncClientWrapper` or `AsyncWrapper`
+- do not pass a custom adapter unless you actually need one
+- if you want explicit construction, use `create_httpx_sync_adapter()` or `create_httpx_async_adapter()`
+- if you copy the folder as a package, import through `__init__.py`
 
-Inherit from `AsyncWrapper` or `SyncClientWrapper` and implement your API methods:
+That keeps integration small and predictable.
+
+## Quick Example
+
+### Async client
 
 ```python
-from async_wrapper import AsyncWrapper
-from pydantic import BaseModel
 from typing import List
+from pydantic import BaseModel
+
+from universal_http import AsyncWrapper
+
 
 class User(BaseModel):
     id: int
     name: str
     email: str
 
-class AsyncWebapi(AsyncWrapper):
-    """Your custom API client"""
-    
+
+class UsersApi(AsyncWrapper):
     async def get_user(self, user_id: int) -> User:
-        """Get user by ID"""
         return await self._request(
             "GET",
             f"/users/{user_id}",
-            response_model=User
+            response_model=User,
         )
-    
+
     async def list_users(self) -> List[User]:
-        """Get all users"""
         return await self._request(
             "GET",
             "/users",
-            response_model=List[User]
-        )
-    
-    async def create_user(self, name: str, email: str) -> User:
-        """Create new user"""
-        return await self._request(
-            "POST",
-            "/users",
-            json={"name": name, "email":  email},
-            response_model=User
+            response_model=List[User],
         )
 ```
 
-### Using Your API Client
-
 ```python
-# Simple usage
-client = AsyncWebapi(base_url="https://api.webapi.com")
-result = await client.get_user(123)
-await client.close()
-
-# With custom adapter config
-client = AsyncWebapi(
-    base_url="https://api.webapi.com",
-    timeout=30.0,
-    max_retries=3,
-    headers={"Authorization": "Bearer token"}
-)
-
-# With async context manager (recommended)
-async with AsyncWebapi(base_url="https://api.webapi.com") as client:
-    user = await client.get_user(123)
-    users = await client.list_users()
+async with UsersApi(base_url="https://api.example.com", timeout=10.0) as client:
+    user = await client.get_user(1)
 ```
 
-### Synchronous Client Example
+### Sync client
 
 ```python
-from wrapper import SyncClientWrapper
+from universal_http import SyncClientWrapper
 
-class SyncWebapi(SyncClientWrapper):
-    """Synchronous API client"""
-    
+
+class UsersApiSync(SyncClientWrapper):
     def get_user(self, user_id: int) -> User:
         return self._request(
             "GET",
             f"/users/{user_id}",
-            response_model=User
+            response_model=User,
         )
-
-# Usage with context manager
-with SyncWebapi(base_url="https://api.webapi.com") as client:
-    user = client.get_user(123)
 ```
-
-## Configuration Options
-
-Both wrapper classes support the following parameters:
-
-- **`base_url`** (required): Base URL for the API
-- **`http_client`** (optional): Custom HTTP client adapter
-- **`timeout`** (optional): Request timeout in seconds
-- **`max_retries`** (optional): Maximum number of retry attempts
-- **`headers`** (optional): Default headers for all requests
-- **`verify`** (optional): SSL certificate verification (default: True)
-- **`**adapter_kwargs`**: Additional adapter-specific parameters
-
-## The `_request` Method
-
-Both wrappers provide a `_request` method for making HTTP calls:
 
 ```python
-async def _request(
-    method: str,              # HTTP method: "GET", "POST", etc. 
-    path: str,                # Endpoint path (e.g., "/users/123")
-    response_model:  Optional[Type[T]] = None,  # Pydantic model for parsing
-    **kwargs                  # Additional params:  json, params, headers, etc.
-) -> T
+with UsersApiSync(base_url="https://api.example.com") as client:
+    user = client.get_user(1)
 ```
 
-**Parameters for `**kwargs`**:
-- `params`: Query parameters (dict)
-- `json`: JSON request body (dict)
-- `data`: Form data or raw body
-- `headers`: Request-specific headers (dict)
-- `timeout`: Override default timeout
+## Configuration
 
-## Installation
+Both wrappers accept:
 
-```bash
-pip install universal-http-api-client
+- `base_url`: API base URL
+- `http_client`: custom adapter instance
+- `timeout`: default timeout in seconds
+- `max_retries`: retry count
+- `headers`: default request headers
+- `verify`: TLS certificate verification flag
+- `**adapter_kwargs`: backend-specific options
+
+Useful adapter kwargs currently supported by the built-in adapters include:
+
+- `backoff_factor`
+- `retry_statuses`
+- `retry_exceptions`
+- `on_request`
+- `on_response`
+
+For `httpx`, the easiest explicit setup is:
+
+```python
+from universal_http import AsyncWrapper, create_httpx_async_adapter
+
+
+class MyApi(AsyncWrapper):
+    pass
+
+
+client = MyApi(
+    base_url="https://api.example.com",
+    http_client=create_httpx_async_adapter(
+        base_url="https://api.example.com",
+        timeout=10.0,
+        headers={"Authorization": "Bearer token"},
+    ),
+)
 ```
 
-## Requirements
+## `_request()` Behavior
 
-- Python 3.9+
-- httpx
-- pydantic
+`_request()` sends the request through the configured adapter and:
 
-## License
+- returns `HttpResponse` when `response_model` is omitted
+- parses JSON into a Pydantic model when `response_model=MyModel`
+- parses JSON arrays into a list of Pydantic models when `response_model=List[MyModel]`
+- raises `HttpError` for HTTP failures and validation/parsing failures
 
-[Add your license here]
+## Operational Notes
 
-## Contributing
+- The wrappers are intended to be subclassed once per external API.
+- The default design target is `httpx + pydantic`.
+- For critical systems, prefer direct wrapper usage or explicit `create_httpx_*_adapter()` helpers over the generic factory helper.
+- `AsyncClientWrapper` is available as an alias for `AsyncWrapper` if you want symmetric naming with `SyncClientWrapper`.
+- Pydantic v2 is assumed because response parsing uses `model_validate()`.
+- If you copy these files into another project, keep them together because the wrappers depend on `adapters.py` and `response_utils.py`.
 
-[Add contributing guidelines here]
+## Known Limitations
+
+- No test suite yet
+- Sync and async wrappers still duplicate some lifecycle/configuration logic
+- Error mapping is intentionally simple and not yet normalized equally across all backends
+- Non-`httpx` adapters are supported, but `httpx` is the only path that should be treated as the primary integration target
+- This is intentionally not packaged as an installable library
+
+## Recommended Next Steps
+
+1. Add unit tests for adapters, retry logic, response parsing, and error mapping.
+2. Keep hardening the `httpx` path first and treat the other adapters as optional compatibility layers.
+3. Add one or two ready-made examples for auth, pagination, and service-specific error translation.
+4. Decide which adapters are truly needed internally and remove dead backends if they are not used.
+5. Add a tiny integration checklist for teams that copy these files into a new service.

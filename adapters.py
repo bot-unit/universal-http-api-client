@@ -7,6 +7,7 @@ from typing import Protocol, Any, Dict, Optional, Union, Callable
 import time
 import random
 import json as _json
+import asyncio
 
 # --- Unified response and errors ---
 
@@ -101,6 +102,12 @@ def _sleep_backoff(attempt: int, backoff_factor: float) -> None:
     jitter = base * 0.1 * random.random()
     time.sleep(base + jitter)
 
+async def _async_sleep_backoff(attempt: int, backoff_factor: float) -> None:
+    # exponential backoff with jitter without blocking the event loop
+    base = backoff_factor * (2 ** max(0, attempt - 1))
+    jitter = base * 0.1 * random.random()
+    await asyncio.sleep(base + jitter)
+
 # --- Concrete Implementations ---
 
 class RequestsAdapter:
@@ -186,6 +193,8 @@ class RequestsAdapter:
                     self._on_response({"method": method, "url": final_url, "status": resp.status_code, "headers": resp.headers})
                 return resp
             except Exception as e:
+                if isinstance(e, HttpError):
+                    raise
                 # Map exceptions
                 if isinstance(e, self._timeout_exc):
                     raise TimeoutError(str(e)) from e
@@ -287,6 +296,8 @@ class HttpxSyncAdapter:
                     self._on_response({"method": method, "url": final_url, "status": resp.status_code, "headers": resp.headers})
                 return resp
             except Exception as e:
+                if isinstance(e, HttpError):
+                    raise
                 if isinstance(e, self._timeout_exc):
                     raise TimeoutError(str(e)) from e
                 if isinstance(e, self._conn_exc):
@@ -377,7 +388,7 @@ class HttpxAsyncAdapter:
                 )
                 status = response.status_code
                 if _should_retry(status, None, self._retry_statuses, self._retry_exceptions) and attempt <= self._max_retries:
-                    _sleep_backoff(attempt, self._backoff_factor)
+                    await _async_sleep_backoff(attempt, self._backoff_factor)
                     continue
                 resp = HttpResponse(status_code=response.status_code, headers=dict(response.headers or {}), content=response.content)
                 if 400 <= response.status_code:
@@ -386,15 +397,17 @@ class HttpxAsyncAdapter:
                     self._on_response({"method": method, "url": final_url, "status": resp.status_code, "headers": resp.headers})
                 return resp
             except Exception as e:
+                if isinstance(e, HttpError):
+                    raise
                 if isinstance(e, self._timeout_exc):
                     raise TimeoutError(str(e)) from e
                 if isinstance(e, self._conn_exc):
                     if attempt <= self._max_retries and _should_retry(None, e, self._retry_statuses, self._retry_exceptions):
-                        _sleep_backoff(attempt, self._backoff_factor)
+                        await _async_sleep_backoff(attempt, self._backoff_factor)
                         continue
                     raise NetworkError(str(e)) from e
                 if attempt <= self._max_retries and _should_retry(None, e, self._retry_statuses, self._retry_exceptions):
-                    _sleep_backoff(attempt, self._backoff_factor)
+                    await _async_sleep_backoff(attempt, self._backoff_factor)
                     continue
                 raise HttpError(None, f"Request failed: {e}") from e
         raise HttpError(None, "Unexpected state in HttpxAsyncAdapter.request")
@@ -461,7 +474,7 @@ class AiohttpAdapter:
                 ) as response:
                     status = response.status
                     if _should_retry(status, None, self._retry_statuses, self._retry_exceptions) and attempt <= self._max_retries:
-                        _sleep_backoff(attempt, self._backoff_factor)
+                        await _async_sleep_backoff(attempt, self._backoff_factor)
                         continue
                     content = await response.read()
                     resp = HttpResponse(status_code=response.status, headers=dict(response.headers or {}), content=content)
@@ -471,15 +484,17 @@ class AiohttpAdapter:
                         self._on_response({"method": method, "url": final_url, "status": resp.status_code, "headers": resp.headers})
                     return resp
             except Exception as e:
+                if isinstance(e, HttpError):
+                    raise
                 if isinstance(e, self._timeout_exc):
                     raise TimeoutError(str(e)) from e
                 if isinstance(e, self._conn_exc):
                     if attempt <= self._max_retries and _should_retry(None, e, self._retry_statuses, self._retry_exceptions):
-                        _sleep_backoff(attempt, self._backoff_factor)
+                        await _async_sleep_backoff(attempt, self._backoff_factor)
                         continue
                     raise NetworkError(str(e)) from e
                 if attempt <= self._max_retries and _should_retry(None, e, self._retry_statuses, self._retry_exceptions):
-                    _sleep_backoff(attempt, self._backoff_factor)
+                    await _async_sleep_backoff(attempt, self._backoff_factor)
                     continue
                 raise HttpError(None, f"Request failed: {e}") from e
         raise HttpError(None, "Unexpected state in AiohttpAdapter.request")
@@ -498,7 +513,28 @@ class Urllib3Adapter:
         self._max_retries = int(client_kwargs.pop('max_retries', 0) or 0)
         self._backoff_factor = float(client_kwargs.pop('backoff_factor', 0.0) or 0.0)
         self._retry_statuses = tuple(client_kwargs.pop('retry_statuses', (429, 503)))
-        self._retry_exceptions = tuple(client_kwargs.pop('retry_exceptions', ()))
+        try:
+            urllib3_exceptions = urllib3.exceptions
+            default_retry_exceptions = (
+                urllib3_exceptions.ConnectTimeoutError,
+                urllib3_exceptions.ReadTimeoutError,
+                urllib3_exceptions.NewConnectionError,
+                urllib3_exceptions.MaxRetryError,
+            )
+            self._timeout_exc = (
+                urllib3_exceptions.ConnectTimeoutError,
+                urllib3_exceptions.ReadTimeoutError,
+                urllib3_exceptions.TimeoutError,
+            )
+            self._conn_exc = (
+                urllib3_exceptions.NewConnectionError,
+                urllib3_exceptions.MaxRetryError,
+            )
+        except Exception:
+            default_retry_exceptions = ()
+            self._timeout_exc = ()
+            self._conn_exc = ()
+        self._retry_exceptions = tuple(client_kwargs.pop('retry_exceptions', default_retry_exceptions))
         self._on_request: Optional[Callable[[Dict[str, Any]], None]] = client_kwargs.pop('on_request', None)
         self._on_response: Optional[Callable[[Dict[str, Any]], None]] = client_kwargs.pop('on_response', None)
         self.http = urllib3.PoolManager(**client_kwargs)
@@ -555,34 +591,62 @@ class Urllib3Adapter:
                     self._on_response({"method": method, "url": url, "status": resp.status_code, "headers": resp.headers})
                 return resp
             except Exception as e:
+                if isinstance(e, HttpError):
+                    raise
                 if attempt <= self._max_retries and _should_retry(None, e, self._retry_statuses, self._retry_exceptions):
                     _sleep_backoff(attempt, self._backoff_factor)
                     continue
-                # urllib3 exposes timeouts as exceptions.TimeoutError (in newer versions) or socket timeout
-                if isinstance(e, TimeoutError):
+                if self._timeout_exc and isinstance(e, self._timeout_exc):
                     raise TimeoutError(str(e)) from e
+                if self._conn_exc and isinstance(e, self._conn_exc):
+                    raise NetworkError(str(e)) from e
                 raise HttpError(None, f"Request failed: {e}") from e
         raise HttpError(None, "Unexpected state in Urllib3Adapter.request")
 
 # --- Factory ---
 
-def create_adapter(backend: str = "httpx", **client_kwargs: Any) -> Union[SyncHttpClient, AsyncHttpClient]:
-    """Create an HTTP adapter by backend name.
-    Supported: 'httpx' (default) -> HttpxSyncAdapter/HttpxAsyncAdapter decision up to caller,
-    'requests', 'aiohttp', 'urllib3'.
+def create_httpx_sync_adapter(**client_kwargs: Any) -> SyncHttpClient:
+    """Preferred sync adapter factory for internal services using httpx."""
+    return HttpxSyncAdapter(**client_kwargs)
 
-    Note: choose sync/async class explicitly if you need specific behavior.
+
+def create_httpx_async_adapter(**client_kwargs: Any) -> AsyncHttpClient:
+    """Preferred async adapter factory for internal services using httpx."""
+    return HttpxAsyncAdapter(**client_kwargs)
+
+
+def create_adapter(
+    backend: str = "httpx-sync",
+    *,
+    is_async: Optional[bool] = None,
+    **client_kwargs: Any,
+) -> Union[SyncHttpClient, AsyncHttpClient]:
+    """Create an adapter by backend name.
+
+    Preferred internal defaults are httpx-based and explicit:
+    - `httpx-sync`
+    - `httpx-async`
+
+    For backward compatibility:
+    - `httpx` + `is_async=True` -> async adapter
+    - `httpx` + `is_async=False/None` -> sync adapter
     """
-    name = (backend or "httpx").lower()
+    name = (backend or "httpx-sync").lower()
     if name == "httpx-sync" or name == "httpx_sync":
         return HttpxSyncAdapter(**client_kwargs)  # type: ignore[return-value]
-    if name == "httpx-async" or name == "httpx_async" or name == "httpx":
-        # default to async httpx (common in modern code) — adjust if you prefer sync by default
+    if name == "httpx-async" or name == "httpx_async":
         return HttpxAsyncAdapter(**client_kwargs)  # type: ignore[return-value]
+    if name == "httpx":
+        if is_async:
+            return HttpxAsyncAdapter(**client_kwargs)  # type: ignore[return-value]
+        return HttpxSyncAdapter(**client_kwargs)  # type: ignore[return-value]
     if name == "requests":
         return RequestsAdapter(**client_kwargs)  # type: ignore[return-value]
     if name == "aiohttp":
         return AiohttpAdapter(**client_kwargs)  # type: ignore[return-value]
     if name == "urllib3":
         return Urllib3Adapter(**client_kwargs)  # type: ignore[return-value]
-    raise ValueError(f"Unsupported backend '{backend}'. Use one of: httpx, httpx-sync, httpx-async, requests, aiohttp, urllib3.")
+    raise ValueError(
+        f"Unsupported backend '{backend}'. "
+        "Use one of: httpx, httpx-sync, httpx-async, requests, aiohttp, urllib3."
+    )
